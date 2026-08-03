@@ -4,8 +4,6 @@ import numpy as np
 import json
 import pandas as pd
 
-from transformers import LlamaForCausalLM, MistralForCausalLM
-
 
 DATASET_NAME_TO_PATH = {
     "advbench_gjo": "data/Advbench/advbench_gjo.csv",
@@ -75,10 +73,10 @@ def get_goals_and_targets(args):
 
 
 def get_embedding_matrix(model):
-    if isinstance(model, (LlamaForCausalLM, MistralForCausalLM)):
-        return model.model.embed_tokens.weight
-
-    raise ValueError(f"Unknown model type: {type(model)}")
+    embeddings = model.get_input_embeddings()
+    if embeddings is None or not hasattr(embeddings, "weight"):
+        raise ValueError(f"Model has no usable input embeddings: {type(model)}")
+    return embeddings.weight
 
 
 def get_illegal_tokens(tokenizer):
@@ -105,7 +103,6 @@ def get_illegal_tokens(tokenizer):
 
     ascii_toks = tuple(set(ascii_toks))
     return ascii_toks
-
 
 
 

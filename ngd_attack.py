@@ -19,13 +19,16 @@ class NGAttack:
         test_targets,        
         args,
     ):
+        self.args = args
         self.model_name = args.source_model
+        self.model_family = getattr(args, "source_family", None)
         self.model, self.tokenizer = model, tokenizer
-        self.model_device = model.device
+        self.model_device = model_input_device(model)
         self.dtype = model.dtype
 
         self.loss_model = AnchorClassifier()
         self.loss_model.load_model(args.loss_model_path)
+        self.loss_model.to(self.model_device)
         self.embed_mat = get_embedding_matrix(model).float()
         self.vocal_size = self.embed_mat.shape[0]
         
@@ -88,8 +91,31 @@ class NGAttack:
         self.gen_config = gen_config
         self.stop_on_success = 1.0
 
-        self.train_prompts = [SuffixManager(self.model_name, self.tokenizer, goal, target, self.num_adv_tokens) for goal, target in zip(train_goals, train_targets)] if len(train_goals) else []
-        self.test_prompts = [SuffixManager(self.model_name, self.tokenizer, goal, target, self.num_adv_tokens) for goal, target in zip(test_goals, test_targets)] if len(test_goals) else []
+        is_prefix = getattr(args, "attack_position", "prefix") == "prefix"
+        self.train_prompts = [
+            SuffixManager(
+                self.model_name,
+                self.tokenizer,
+                goal,
+                target,
+                self.num_adv_tokens,
+                is_prefix=is_prefix,
+                model_family=self.model_family,
+            )
+            for goal, target in zip(train_goals, train_targets)
+        ] if len(train_goals) else []
+        self.test_prompts = [
+            SuffixManager(
+                self.model_name,
+                self.tokenizer,
+                goal,
+                target,
+                self.num_adv_tokens,
+                is_prefix=is_prefix,
+                model_family=self.model_family,
+            )
+            for goal, target in zip(test_goals, test_targets)
+        ] if len(test_goals) else []
         self.all_prompts = self.train_prompts + self.test_prompts
 
         self.anchor_datasets = args.anchor_datasets
@@ -101,7 +127,7 @@ class NGAttack:
             sm = args.source_model.split('/')[-1]
             self.save_folder = f'./results/{sm}-ng-source{args.source_model}-{args.train_dataset}-trainum{len(self.train_prompts)}-iters{self.num_steps}-numtokens{self.num_adv_tokens}-lr{self.lr}-beta{self.beta_1}-{self.beta_2}-tau{self.begin_tau}-{self.final_tau}_{timestamp}.json'
             print(f"save path: {self.save_folder}")
-        os.makedirs('./results', exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(self.save_folder)), exist_ok=True)
 
     def __str__(self):
         print("Print params.\n")
@@ -123,7 +149,16 @@ class NGAttack:
         best_adv_prompt, best_avg_train_asr, best_avg_test_asr, best_avg_loss = None, 0.0, 0.0, 10000.0
         seen_set, buffer_set = set(), set()
         buffer_id = 0
-        logs = {}
+        logs = {
+            "metadata": {
+                "schema_version": 1,
+                "source_model": self.model_name,
+                "source_family": self.model_family,
+                "attack_position": getattr(self.args, "attack_position", "prefix"),
+                "seed": getattr(self.args, "seed", None),
+                "model_load_metadata": getattr(self.args, "model_load_metadata", {}),
+            }
+        }
         for step in range(self.num_steps):
             target_grads = []
             total_loss = 0.0
@@ -249,7 +284,7 @@ class NGAttack:
         plot_curve_1(harm_preds, save_path=f"./prob_{png_save_suffix}")
     
     def get_loss_and_grad(self, soft_opt, input_ids, adv_slice, target_slice):
-        embeds = self.model.model.embed_tokens(input_ids).detach() 
+        embeds = self.model.get_input_embeddings()(input_ids).detach()
         adv_embeds = (soft_opt @ self.embed_mat).to(self.dtype) 
         input_embeds = torch.cat(
             [
@@ -260,7 +295,10 @@ class NGAttack:
 
         output = self.model(inputs_embeds=input_embeds, output_hidden_states=True)
         hidden_states = output.hidden_states[-1][:, -1, :] 
-        target = torch.zeros((self.batch_size, 1)).cuda()
+        target = torch.zeros(
+            (hidden_states.size(0), 1),
+            device=hidden_states.device,
+        )
         loss, harm_pred = self.loss_func(hidden_states, target, True)
         grad = torch.autograd.grad(loss, soft_opt, retain_graph=False, create_graph=False)[0] 
 
@@ -313,7 +351,10 @@ class NGAttack:
                 
                 output = self.model(input_ids=full_input_ids, output_hidden_states=True)
                 hidden_states = output.hidden_states[-1][:, -1, :] 
-                target = torch.zeros((hidden_states.size(0), 1)).cuda()
+                target = torch.zeros(
+                    (hidden_states.size(0), 1),
+                    device=hidden_states.device,
+                )
                 test_loss = self.loss_func(hidden_states, target) 
                 total_loss += test_loss
             
@@ -413,18 +454,34 @@ class NGAttack:
                 raise ValueError(f"Unsupported file type: {file_extension}")
 
         dataset_anchor_benign = load_anchor_dataset(self.anchor_datasets[0])
-        dataset_anchor_benign = dataset_anchor_benign.sample(n=min(100, len(dataset_anchor_benign)))
+        dataset_anchor_benign = dataset_anchor_benign.sample(
+            n=min(100, len(dataset_anchor_benign)),
+            random_state=getattr(self.args, "seed", 0),
+        )
         dataset_anchor_benign = dataset_anchor_benign.to_numpy()
 
         dataset_anchor_harmful = load_anchor_dataset(self.anchor_datasets[1])
-        dataset_anchor_harmful = dataset_anchor_harmful.sample(n=min(100, len(dataset_anchor_harmful)))
+        dataset_anchor_harmful = dataset_anchor_harmful.sample(
+            n=min(100, len(dataset_anchor_harmful)),
+            random_state=getattr(self.args, "seed", 0),
+        )
         dataset_anchor_harmful = dataset_anchor_harmful.to_numpy()
 
-        full_prompts_benign = batch_apply_chat_template(tokenizer, dataset_anchor_benign, self.model_name)
+        full_prompts_benign = batch_apply_chat_template(
+            tokenizer,
+            dataset_anchor_benign,
+            self.model_name,
+            model_family=self.model_family,
+        )
         hidden_states_benign = get_hidden_states(model, tokenizer, full_prompts_benign)
         hidden_states_benign = hidden_states_benign.view(hidden_states_benign.shape[0], -1)
 
-        full_prompts_harmful = batch_apply_chat_template(tokenizer, dataset_anchor_harmful, self.model_name)
+        full_prompts_harmful = batch_apply_chat_template(
+            tokenizer,
+            dataset_anchor_harmful,
+            self.model_name,
+            model_family=self.model_family,
+        )
         hidden_states_harmful = get_hidden_states(model, tokenizer, full_prompts_harmful)
         hidden_states_harmful = hidden_states_harmful.view(hidden_states_harmful.shape[0], -1)
 
@@ -434,8 +491,8 @@ class NGAttack:
         print(f"==>> PCA explained variance ratio: {pca_object.explained_variance_ratio_}, sum: {np.sum(pca_object.explained_variance_ratio_)}")
 
         self.pca_object = pca_object
-        self.mean = torch.tensor(pca_object.mean_).to(model.device) 
-        self.components = torch.tensor(pca_object.components_).to(model.device) 
+        self.mean = torch.tensor(pca_object.mean_).to(self.model_device)
+        self.components = torch.tensor(pca_object.components_).to(self.model_device)
 
     def to_recoverable(self, x):
         gen_str = self.tokenizer.decode(x)
@@ -452,7 +509,8 @@ class NGAttack:
 
         return soft_opt
     def clean_cache(self):
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 def plot_curve(loss, S, loss_max=None, loss_min=None, save_path="./loss_and_pmax_new.png"):
     fig, ax1 = plt.subplots(figsize=(10, 6))
@@ -507,4 +565,3 @@ def plot_curve_1(preds, save_path="./prob.png"):
     plt.show()
 
     
-

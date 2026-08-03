@@ -1,0 +1,20 @@
+{
+  "models": {
+    "qwen": {
+      "path": "Models/Qwen3-8B-Instruct"
+    },
+    "llama": {
+      "path": "Models/Meta-Llama-3.1-8B-Instruct"
+    },
+    "mistral": {
+      "path": "Models/Mistral-7B-Instruct-v0.3"
+    },
+    "vicuna": {
+      "path": "Models/vicuna-7b-v1.5"
+    },
+    "internlm": {
+      "path": "Models/internlm3-8b-instruct",
+      "trust_remote_code": true
+    }
+  }
+}

@@ -7,45 +7,50 @@ from .common import MODEL_NAME_TO_PATH
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from pathlib import Path
 
-def get_hfmodel(model_name, device='cuda', dtype=torch.float16):
+from .model_adapter import (
+    MODEL_FAMILIES,
+    chat_template_generation_kwargs,
+    ensure_known_chat_template,
+    infer_model_family,
+    load_model_and_tokenizer,
+    model_input_device,
+)
+
+def get_hfmodel(
+    model_name,
+    device='cuda',
+    dtype=torch.float16,
+    *,
+    family=None,
+    trust_remote_code=False,
+    local_files_only=False,
+    return_metadata=False,
+):
     if "cuda" in device:
         device_map = 'auto'
     else:
         device_map = "cpu"
 
-    model_path = MODEL_NAME_TO_PATH[model_name]
-    model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype, 
-            low_cpu_mem_usage=True,
+    model, tokenizer, metadata = load_model_and_tokenizer(
+            model_name,
+            aliases=MODEL_NAME_TO_PATH,
+            family=family,
+            torch_dtype=dtype,
             device_map=device_map,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+            use_fast=False,
     )
-    model.requires_grad_(False)
-    model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-
-    if "llama-2" in model_path.lower():
-        tokenizer.pad_token = tokenizer.unk_token
-        tokenizer.padding_side = "left"
-    if "vicuna" in model_path.lower():
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-    if 'llama-3' in model_path.lower():
-        tokenizer.padding_side = 'left'
-    if "mistral" in model_path.lower() or "mixtral" in model_path.lower():
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    if 'guanaco' in model_path.lower():
+    model_path = metadata["resolved_model_reference"]
+    if 'guanaco' in str(model_path).lower():
         tokenizer.eos_token_id = 2
         tokenizer.unk_token_id = 0
 
-    if not tokenizer.pad_token:
-        tokenizer.pad_token = tokenizer.eos_token
-
     print("==>> The source model is loaded !\n")
+    if return_metadata:
+        return model, tokenizer, metadata
     return model, tokenizer
 
 def get_chat_template(model_name="vicuna"):
@@ -56,7 +61,17 @@ def get_chat_template(model_name="vicuna"):
     return chat_template
 
 class SuffixManager:
-    def __init__(self, model_name, tokenizer, user_prompt, target="", num_adv_tokens=20, enable_sys=False, is_prefix=True):
+    def __init__(
+        self,
+        model_name,
+        tokenizer,
+        user_prompt,
+        target="",
+        num_adv_tokens=20,
+        enable_sys=False,
+        is_prefix=True,
+        model_family=None,
+    ):
         self.tokenizer = tokenizer
         self.user_prompt = user_prompt
         self.target = target
@@ -64,26 +79,31 @@ class SuffixManager:
         self.is_prefix = is_prefix 
         self.adv_content = (self.tokenizer.pad_token * self.num_adv_tokens).strip()
 
-        if 'zephyr' in model_name:
-            model_name = 'zephyr'
+        reference = str(model_name)
+        if 'zephyr' in reference.lower():
+            family = "zephyr"
             system_prompt = ZEPHYR
-        elif 'vicuna' in model_name:
-            model_name = 'vicuna'
+        else:
+            family = infer_model_family(reference, explicit_family=model_family)
+        if family == 'vicuna':
             system_prompt = VICUNA
-        elif 'llama3' in model_name:
-            model_name = 'llama-3-instruct'
+        elif family == 'llama' and ('llama3' in reference.lower() or 'llama-3' in reference.lower()):
             system_prompt = LLAMA3
-        elif 'llama2' in model_name:
-            model_name = 'llama-2-chat'
+        elif family == 'llama':
             system_prompt = LLAMA2
-        elif 'mistral' in model_name:
-            model_name = 'mistral-instruct'
+        elif family == 'mistral':
             system_prompt = MISTRAL
+        elif family in {'qwen', 'internlm'}:
+            system_prompt = ""
+        elif family == "zephyr":
+            system_prompt = ZEPHYR
         else:
             raise ValueError('model not supported yet')
         
-        self.model_name = model_name
+        self.model_name = reference
+        self.model_family = family
         self.system_prompt = system_prompt if enable_sys else ""
+        ensure_known_chat_template(self.tokenizer, self.model_family)
 
     def get_prompt(self, adv_content=None):
         if adv_content is not None:
@@ -107,9 +127,12 @@ class SuffixManager:
             'content': self.target
         }]
 
-        self.tokenizer.chat_template = get_chat_template(self.model_name) 
-
-        string = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        string = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_generation_kwargs(self.tokenizer),
+        )
         string = self.target.join(string.split(self.target)[:-1])
         string = string + self.target
 
@@ -124,7 +147,7 @@ class SuffixManager:
         target_start = -1
         adv_start, adv_stop = -1, -1
         
-        for i in range(target_stop, 0, -1):
+        for i in range(target_stop - 1, 0, -1):
             if self.tokenizer.decode(input_ids[i:]) == self.target:
                 target_start = i
                 break
@@ -174,27 +197,30 @@ class SuffixManager:
         return input_ids
     
 
-def batch_apply_chat_template(tokenizer, texts, model_name):
-    if 'zephyr' in model_name:
-        model_name = 'zephyr'
+def batch_apply_chat_template(tokenizer, texts, model_name, model_family=None):
+    reference = str(model_name)
+    if 'zephyr' in reference.lower():
+        family = "zephyr"
         system_prompt = ZEPHYR
-    elif 'vicuna' in model_name:
-        model_name = 'vicuna'
+    else:
+        family = infer_model_family(reference, explicit_family=model_family)
+    if family == 'vicuna':
         system_prompt = VICUNA
-    elif 'llama3' in model_name:
-        model_name = 'llama-3-instruct'
+    elif family == 'llama' and ('llama3' in reference.lower() or 'llama-3' in reference.lower()):
         system_prompt = LLAMA3
-    elif 'llama2' in model_name:
-        model_name = 'llama-2-chat'
+    elif family == 'llama':
         system_prompt = LLAMA2
-    elif 'mistral' in model_name:
-        model_name = 'mistral-instruct'
+    elif family == 'mistral':
         system_prompt = MISTRAL
+    elif family in {'qwen', 'internlm'}:
+        system_prompt = ""
+    elif family == "zephyr":
+        system_prompt = ZEPHYR
     else:
         raise ValueError('model not supported yet')
     
     full_prompt_list = []
-    tokenizer.chat_template = get_chat_template(model_name)
+    ensure_known_chat_template(tokenizer, family)
     for idx, text in enumerate(texts):
         messages = [{
             'role': 'system',
@@ -205,7 +231,10 @@ def batch_apply_chat_template(tokenizer, texts, model_name):
         }]
 
         full_prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_generation_kwargs(tokenizer),
         )
         full_prompt_list.append(full_prompt)
 
@@ -220,7 +249,7 @@ def get_hidden_states(model, tokenizer, full_prompt_list):
         for full_prompt in tqdm(full_prompt_list, desc="Calculating hidden states"):
             inputs = tokenizer(
                 full_prompt, return_tensors="pt", padding=True, truncation=True
-            ).to(model.device)
+            ).to(model_input_device(model))
             outputs = model(**inputs, output_hidden_states=True)
             # Get the last hidden state of the last token for each sequence
             # We use -1 to index the last layer, and -1 again to index the hidden state of the last token
@@ -245,7 +274,14 @@ class AnchorClassifier(nn.Module):
         prob = self.sigmoid(logits)
         return prob 
 
-    def train_model(self, benign_data, harmful_data, epochs=1000, lr=1e-3, save_path="anchor_classifier.pth"):
+    def train_model(
+        self,
+        benign_data,
+        harmful_data,
+        epochs=1000,
+        lr=1e-3,
+        save_path="checkpoints/anchor_classifier.pth",
+    ):
         """
         :param benign_data: shape=(100,4)
         :param harmful_data: shape=(100,4)
@@ -253,6 +289,7 @@ class AnchorClassifier(nn.Module):
         :param lr
         :param save_path
         """
+        Path(save_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         X = np.vstack([benign_data, harmful_data])
         y = np.hstack([np.zeros(100), np.ones(100)])
         
@@ -287,7 +324,7 @@ class AnchorClassifier(nn.Module):
         print(f"\nTraining complete! Best Accuracy: {best_acc:.4f}")
         print(f"Model saved to: {save_path}")
 
-    def load_model(self, model_path="anchor_classifier.pth"):
+    def load_model(self, model_path="checkpoints/anchor_classifier.pth"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
         try:
