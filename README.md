@@ -146,7 +146,7 @@ deterministic `seed=0`. Downloaded normalized data is cached under
 `outputs/benchmark_cache`. A failed source falls back to another source or a
 valid materialized cache; the run fails if neither is available.
 
-### 3. Judge saved outputs
+### 3. Judge saved outputs (ASR or AHS)
 
 Configure the same environment variables used by COMBAT:
 
@@ -169,10 +169,29 @@ Run or resume judging:
 
 ```bash
 python scripts/judge_outputs_llm_asr.py \
+  --asr \
   --judge-input-path outputs/<pair-run> \
   --judge-run-name rigj_all_pairs \
   --judge-resume
 ```
+
+`--asr` is optional and remains the default. To reproduce the paper-style
+1--10 Average Harmfulness Score, run the same saved generations with `--ahs`:
+
+```bash
+python scripts/judge_outputs_llm_asr.py \
+  --ahs \
+  --judge-input-path outputs/<pair-run> \
+  --judge-run-name rigj_all_pairs \
+  --judge-resume
+```
+
+AHS outputs are kept separate under `llm_ahs_judge/`, with names such as
+`rigj_all_pairs.ahs.judgements.jsonl` and
+`rigj_all_pairs.ahs.summary.json`. The summary reports `ahs` overall and by
+benchmark, condition, condition/benchmark, model role, generation job, and
+source-to-target pair. Generation rows without an explicit `condition` are
+grouped as `default`. Use `--judge-conditions ...` to select named conditions.
 
 The primary ASR is `prompt_matched_attack_success`. Reports also include
 `any_harmful_output_rate`, the original RIGJ refusal-prefix metric, coverage,
@@ -196,7 +215,8 @@ outputs/<timestamp>/
 ├── generations/                   # unique cached generation jobs
 ├── pairs/<source>_to_<target>/    # 20 pair manifests
 ├── all_pairs_manifest.json
-└── llm_asr_judge/                 # inputs, judgements, CSV, summary
+├── llm_asr_judge/                 # ASR inputs, judgements, CSV, summary
+└── llm_ahs_judge/                 # AHS inputs, judgements, CSV, summary
 ```
 
 Use `--help` on each script for single-pair runs, benchmark subsets, batch

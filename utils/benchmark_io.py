@@ -26,34 +26,17 @@ PAPER_HARMFUL_BENCHMARKS = (
     "wildjailbreak",
 )
 MODEL_FAMILY_ORDER = ("qwen", "llama", "mistral", "vicuna", "internlm")
+HARMBENCH_OFFICIAL_STANDARD_COUNT = 159
+HARMBENCH_OFFICIAL_TEST_URL = (
+    "https://raw.githubusercontent.com/centerforaisafety/HarmBench/main/"
+    "data/behavior_datasets/harmbench_behaviors_text_test.csv"
+)
 
 HARMFUL_BENCH_SPECS: dict[str, list[dict[str, str]]] = {
     "harmbench": [
         {
             "kind": "url",
-            "value": "https://raw.githubusercontent.com/centerforaisafety/HarmBench/main/data/behavior_datasets/harmbench_behaviors_text_test.csv",
-        },
-        {
-            "kind": "url",
-            "value": "https://raw.githubusercontent.com/centerforaisafety/HarmBench/main/data/behavior_datasets/harmbench_behaviors_text_all.csv",
-        },
-        {
-            "kind": "hf_rows",
-            "dataset": "swiss-ai/harmbench",
-            "config": "DirectRequest",
-            "split": "test",
-        },
-        {
-            "kind": "hf_rows",
-            "dataset": "swiss-ai/harmbench",
-            "config": "HumanJailbreaks",
-            "split": "test",
-        },
-        {
-            "kind": "hf_rows",
-            "dataset": "mariagrandury/harmbench",
-            "config": "DirectRequest",
-            "split": "test",
+            "value": HARMBENCH_OFFICIAL_TEST_URL,
         },
     ],
     "jailbreakbench": [
@@ -616,6 +599,36 @@ def _source_description(spec: dict[str, str]) -> str:
     )
 
 
+def _validate_benchmark_records(
+    benchmark: str,
+    records: list[dict[str, Any]],
+    *,
+    source: str,
+) -> None:
+    if benchmark != "harmbench":
+        return
+    if source != HARMBENCH_OFFICIAL_TEST_URL:
+        raise ValueError(
+            "HarmBench must come from the official text_test CSV; "
+            f"got source={source!r}"
+        )
+    if len(records) != HARMBENCH_OFFICIAL_STANDARD_COUNT:
+        raise ValueError(
+            "official HarmBench text_test must yield exactly "
+            f"{HARMBENCH_OFFICIAL_STANDARD_COUNT} standard rows, got {len(records)}"
+        )
+    invalid_sources = {
+        str(record.get("source") or "")
+        for record in records
+        if str(record.get("source") or "") != HARMBENCH_OFFICIAL_TEST_URL
+    }
+    if invalid_sources:
+        raise ValueError(
+            "HarmBench cache contains non-text_test sources: "
+            f"{sorted(invalid_sources)!r}"
+        )
+
+
 def _download_named_benchmark(
     benchmark: str,
     *,
@@ -649,6 +662,15 @@ def _download_named_benchmark(
                 source=source,
             )
             if records:
+                try:
+                    _validate_benchmark_records(
+                        benchmark,
+                        records,
+                        source=source,
+                    )
+                except ValueError as exc:
+                    errors.append(f"{source}: {exc}")
+                    continue
                 return records, source, errors, counts
             errors.append(
                 f"{source}: no usable rows after {benchmark} filtering/normalization"
@@ -688,21 +710,44 @@ def load_harmful_benchmarks(
         counts: dict[str, Any] = {}
         records: list[dict[str, Any]] = []
 
-        if cache_path.is_file() and not refresh:
-            records = read_jsonl(cache_path)
+        cached_records: list[dict[str, Any]] = []
+        cached_source = ""
+        cached_counts: dict[str, Any] = {}
+        if cache_path.is_file():
+            cached_records = read_jsonl(cache_path)
             cached_meta = (
                 json.loads(meta_path.read_text(encoding="utf-8"))
                 if meta_path.is_file()
                 else {}
             )
-            source = str(cached_meta.get("source", cache_path))
-            counts = dict(cached_meta.get("counts") or {})
+            cached_source = str(cached_meta.get("source", cache_path))
+            cached_counts = dict(cached_meta.get("counts") or {})
+            try:
+                _validate_benchmark_records(
+                    benchmark,
+                    cached_records,
+                    source=cached_source,
+                )
+            except ValueError as exc:
+                errors.append(f"invalid cache {cache_path}: {exc}")
+                cached_records = []
+
+        if cached_records and not refresh:
+            records = cached_records
+            source = cached_source
+            counts = cached_counts
         else:
-            records, source, errors, counts = _download_named_benchmark(
-                benchmark,
-                timeout_seconds=timeout_seconds,
+            downloaded, downloaded_source, download_errors, downloaded_counts = (
+                _download_named_benchmark(
+                    benchmark,
+                    timeout_seconds=timeout_seconds,
+                )
             )
-            if records:
+            errors.extend(download_errors)
+            if downloaded:
+                records = downloaded
+                source = downloaded_source
+                counts = downloaded_counts
                 write_jsonl(cache_path, records)
                 atomic_write_json(
                     meta_path,
@@ -715,19 +760,14 @@ def load_harmful_benchmarks(
                         "materialized_at": utc_timestamp(),
                     },
                 )
-            elif cache_path.is_file():
-                records = read_jsonl(cache_path)
-                cached_meta = (
-                    json.loads(meta_path.read_text(encoding="utf-8"))
-                    if meta_path.is_file()
-                    else {}
-                )
-                source = str(cached_meta.get("source", cache_path))
-                counts = dict(cached_meta.get("counts") or {})
+            elif cached_records:
+                records = cached_records
+                source = cached_source
+                counts = cached_counts
             else:
                 raise RuntimeError(
                     f"failed to load required benchmark {benchmark}; "
-                    f"no usable cache at {cache_path}; errors={errors}"
+                    f"no valid official cache at {cache_path}; errors={errors}"
                 )
         if not records:
             raise RuntimeError(f"required benchmark {benchmark} produced zero records")
